@@ -1,6 +1,7 @@
 package ratelimiter
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -23,6 +24,15 @@ type RateLimiter struct {
 	stopwatch  SleepingStopwatch
 
 	sync.RWMutex
+}
+
+func (rl *RateLimiter) String() string {
+	return fmt.Sprintf(
+		"storedPermits:%.2f, maxPermits:%.2f,stableIntervalMicros:%.2f,nextFreeTicketMicros:%d",
+		rl.storedPermits, rl.maxPermits,
+		rl.stableIntervalMicros,
+		rl.nextFreeTicketMicros,
+	)
 }
 
 type rateSetter interface {
@@ -72,9 +82,12 @@ func (rl *RateLimiter) SetRate(permitsPerSecond float64) bool {
 	if permitsPerSecond <= 0 || math.IsNaN(permitsPerSecond) {
 		return false
 	}
-
 	rl.Lock()
-	rl.rateSetter.set(permitsPerSecond, float64(rl.stopwatch.ReadMicros()))
+	rl.stableIntervalMicros = float64(time.Second/time.Microsecond) / permitsPerSecond
+
+	nowMicros := rl.stopwatch.ReadMicros()
+	rl.resync(nowMicros)
+	rl.rateSetter.set(permitsPerSecond, float64(nowMicros))
 	rl.Unlock()
 	return true
 }
@@ -144,7 +157,7 @@ func (rl *RateLimiter) resync(nowMicros int64) {
 	}
 
 	newPermits := float64(nowMicros - rl.nextFreeTicketMicros)
-	newPermits /= float64(time.Microsecond) * rl.coolDownIntervalMicros()
+	newPermits /= rl.coolDownIntervalMicros()
 	rl.storedPermits = math.Min(rl.maxPermits, rl.storedPermits+newPermits)
 	rl.nextFreeTicketMicros = nowMicros
 }

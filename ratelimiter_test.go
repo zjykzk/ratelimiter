@@ -21,7 +21,7 @@ func (fs *fakeStopwatch) ReadMicros() int64 {
 
 func (fs *fakeStopwatch) sleepWithCaption(caption string, d time.Duration) {
 	fs.instant += int64(d)
-	fs.events = append(fs.events, caption+fmt.Sprintf("%3.2f", float64(d)/float64(time.Nanosecond)))
+	fs.events = append(fs.events, caption+fmt.Sprintf("%3.2f", float64(d)/float64(time.Second)))
 }
 
 func (fs *fakeStopwatch) Sleep(d time.Duration) {
@@ -29,7 +29,7 @@ func (fs *fakeStopwatch) Sleep(d time.Duration) {
 }
 
 func (fs *fakeStopwatch) sleepMillis(m int64) {
-	fs.sleepWithCaption("U", time.Duration(m))
+	fs.sleepWithCaption("U", time.Duration(m)*time.Millisecond)
 }
 
 func (fs *fakeStopwatch) String() string {
@@ -40,6 +40,11 @@ func (fs *fakeStopwatch) readEventsAndClear() string {
 	ret := strings.Join(fs.events, ",")
 	fs.events = fs.events[:0]
 	return ret
+}
+
+func assertEqual(t *testing.T, a, b time.Duration) {
+	d := float64(a-b) / float64(time.Second/time.Microsecond)
+	assert.True(t, math.Abs(d) < 1e-8, fmt.Sprintf("a:%d, b:%d, a-b:%f", a, b, d))
 }
 
 func assertEvents(t *testing.T, sw *fakeStopwatch, events ...string) {
@@ -77,6 +82,7 @@ func TestDoubleMinValueCanAcquireExactlyOnce(t *testing.T) {
 	})
 	b, _ := rl.TryAcquire(1)
 	assert.True(t, b, "Unable to acquire initial permit")
+	b, _ = rl.TryAcquire(1)
 	assert.False(t, b, "Capable of acquiring an additional permit")
 
 	sw.sleepMillis(math.MaxInt32)
@@ -130,12 +136,12 @@ func TestSimpleAcquireReturnValues(t *testing.T) {
 		PermitsPerSecond: 5.0,
 	})
 	st, _ := rl.Acquire(1)
-	assert.Equal(t, 0, st) // R0.00
-	sw.sleepMillis(200)    // U0.20, we are ready for the next request...
+	assert.Equal(t, 0, int(st)) // R0.00
+	sw.sleepMillis(200)         // U0.20, we are ready for the next request...
 	st, _ = rl.Acquire(1)
-	assert.Equal(t, 0, st) // R0.00
+	assert.Equal(t, 0, int(st)) // R0.00
 	st, _ = rl.Acquire(1)
-	assert.Equal(t, 2*time.Millisecond/10, st) // R0.20
+	assert.Equal(t, time.Duration(rl.stableIntervalMicros)*time.Microsecond, st) // R0.20
 	assertEvents(t, sw, "R0.00", "U0.20", "R0.00", "R0.20")
 }
 
@@ -146,14 +152,17 @@ func TestSimpleAcquireEarliestAvailableIsInPast(t *testing.T) {
 		PermitsPerSecond: 5.0,
 	})
 	st, _ := rl.Acquire(1)
-	assert.Equal(t, 0, st)
+	assert.Equal(t, 0, int(st))
 	sw.sleepMillis(400)
+
 	st, _ = rl.Acquire(1)
-	assert.Equal(t, 0, st)
+	assert.Equal(t, 0, int(st))
+
 	st, _ = rl.Acquire(1)
-	assert.Equal(t, 0, st)
+	assert.Equal(t, 0, int(st))
+
 	st, _ = rl.Acquire(1)
-	assert.Equal(t, 2*time.Millisecond/10, st)
+	assertEqual(t, time.Duration(rl.stableIntervalMicros)*time.Microsecond, st)
 }
 
 func TestOneSecondBurst(t *testing.T) {
