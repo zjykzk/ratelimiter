@@ -1,6 +1,7 @@
 package ratelimiter
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -23,6 +24,9 @@ type RateLimiter struct {
 	rateSetter rateSetter
 	stopwatch  SleepingStopwatch
 
+	storedPermitsToWaitTimeBuilder storedPermitsToWaitTimeBuilder
+	coolDownIntervalGetter         coolDownIntervalGetter
+
 	sync.RWMutex
 }
 
@@ -39,12 +43,20 @@ type rateSetter interface {
 	set(permitsPerSecond, stableIntervalMicros float64)
 }
 
-type burstRateSetter struct {
+type storedPermitsToWaitTimeBuilder interface {
+	storedPermitsToWaitTime(storedPermits, permitsToTake float64) int64
+}
+
+type coolDownIntervalGetter interface {
+	coolDownIntervalMicros() float64
+}
+
+type burst struct {
 	*RateLimiter
 	maxBurstSeconds int
 }
 
-func (b *burstRateSetter) set(permitsPerSecond, stableIntervalMicros float64) {
+func (b *burst) set(permitsPerSecond, stableIntervalMicros float64) {
 	oldMaxPermits := b.maxPermits
 	b.maxPermits = float64(b.maxBurstSeconds) * permitsPerSecond
 	if oldMaxPermits == math.Inf(1) {
@@ -57,6 +69,62 @@ func (b *burstRateSetter) set(permitsPerSecond, stableIntervalMicros float64) {
 	} else {
 		b.storedPermits = b.storedPermits * b.maxPermits / oldMaxPermits
 	}
+}
+
+func (b *burst) storedPermitsToWaitTime(storedPermits, permitsToTake float64) int64 {
+	return 0
+}
+
+func (b *burst) coolDownIntervalMicros() float64 {
+	return b.stableIntervalMicros
+}
+
+type warmup struct {
+	*RateLimiter
+
+	warmupPeriodMicro int64
+	coldFactor        float64
+	slop              float64
+	thresholdPermits  float64
+}
+
+func (w *warmup) set(permitsPerSecond, stableIntervalMicros float64) {
+	oldMaxPermits := w.maxPermits
+	coldIntervalMicros := stableIntervalMicros * w.coldFactor
+	w.thresholdPermits = .5 * float64(w.warmupPeriodMicro) / stableIntervalMicros
+
+	w.maxPermits = w.thresholdPermits
+	w.maxPermits += 2 * float64(w.warmupPeriodMicro) / (stableIntervalMicros + coldIntervalMicros)
+
+	w.slop = (coldIntervalMicros - stableIntervalMicros) / (w.maxPermits - w.thresholdPermits)
+
+	switch oldMaxPermits {
+	case math.Inf(1):
+		w.storedPermits = 0
+	case 0:
+		w.storedPermits = w.maxPermits // initial state is cold
+	default:
+		w.storedPermits *= w.maxPermits / oldMaxPermits
+	}
+}
+
+func (w *warmup) coolDownIntervalMicros() float64 {
+	return float64(w.warmupPeriodMicro) / w.maxPermits
+}
+
+func (w *warmup) storedPermitsToWaitTime(storedPermits, permitsToTake float64) int64 {
+	availablePermitsAboveThreshold := storedPermits - w.thresholdPermits
+	micros := int64(0)
+	if availablePermitsAboveThreshold > 0 {
+		permitsAboveThresholdToTake := math.Min(availablePermitsAboveThreshold, permitsToTake)
+		l := w.stableIntervalMicros + availablePermitsAboveThreshold*w.slop +
+			w.stableIntervalMicros + (availablePermitsAboveThreshold-permitsAboveThresholdToTake)*w.slop
+		micros = int64(permitsAboveThresholdToTake * l / 2)
+		permitsToTake -= permitsAboveThresholdToTake
+	}
+	micros += int64(w.stableIntervalMicros * permitsToTake)
+
+	return micros
 }
 
 // Acquire acquires the given number of permits from this RateLimiter, blocking until the request
@@ -84,10 +152,8 @@ func (rl *RateLimiter) SetRate(permitsPerSecond float64) bool {
 	}
 	rl.Lock()
 	rl.stableIntervalMicros = float64(time.Second/time.Microsecond) / permitsPerSecond
-
-	nowMicros := rl.stopwatch.ReadMicros()
-	rl.resync(nowMicros)
-	rl.rateSetter.set(permitsPerSecond, float64(nowMicros))
+	rl.resync(rl.stopwatch.ReadMicros())
+	rl.rateSetter.set(permitsPerSecond, rl.stableIntervalMicros)
 	rl.Unlock()
 	return true
 }
@@ -157,7 +223,7 @@ func (rl *RateLimiter) resync(nowMicros int64) {
 	}
 
 	newPermits := float64(nowMicros - rl.nextFreeTicketMicros)
-	newPermits /= rl.coolDownIntervalMicros()
+	newPermits /= rl.coolDownIntervalGetter.coolDownIntervalMicros()
 	rl.storedPermits = math.Min(rl.maxPermits, rl.storedPermits+newPermits)
 	rl.nextFreeTicketMicros = nowMicros
 }
@@ -172,8 +238,9 @@ func (rl *RateLimiter) reserveEarliestAvailable(requiredPermits uint, nowMicros 
 	returnValue := rl.nextFreeTicketMicros
 	storedPermitsToSpend := math.Min(float64(requiredPermits), rl.storedPermits)
 	freshPermits := float64(requiredPermits) - storedPermitsToSpend
-	waitMicros := rl.storedPermitsToWaitTime(rl.storedPermits, storedPermitsToSpend) +
-		int64(freshPermits*rl.stableIntervalMicros)
+	waitMicros := rl.storedPermitsToWaitTimeBuilder.storedPermitsToWaitTime(
+		rl.storedPermits, storedPermitsToSpend,
+	) + int64(freshPermits*rl.stableIntervalMicros)
 
 	rl.nextFreeTicketMicros = saturatedAdd(rl.nextFreeTicketMicros, waitMicros)
 	rl.storedPermits -= storedPermitsToSpend
@@ -189,14 +256,6 @@ func saturatedAdd(a, b int64) int64 {
 	return math.MaxInt64 + ((naiveSum >> 63) ^ 1)
 }
 
-func (rl *RateLimiter) storedPermitsToWaitTime(storedPermits, permitsToTake float64) int64 {
-	return 0
-}
-
-func (rl *RateLimiter) coolDownIntervalMicros() float64 {
-	return rl.stableIntervalMicros
-}
-
 // Config the configuration for creating the ratelimiter
 // WarmupPeriodMicro is the warm up period for the warm up ratelimiter, if it equals zero returns
 // burst rate limiter
@@ -204,6 +263,7 @@ type Config struct {
 	Stopwatch        SleepingStopwatch
 	PermitsPerSecond float64
 	WarmupPeriod     time.Duration
+	ColdFactor       float64
 }
 
 // Create creates the ratelimiter
@@ -213,9 +273,25 @@ func Create(conf Config) (*RateLimiter, error) {
 		sw = &systemStopwatch{}
 	}
 
+	if conf.WarmupPeriod < 0 {
+		return nil, errors.New("bad warm period")
+	}
+
 	rl := &RateLimiter{stopwatch: sw}
 	if conf.WarmupPeriod == 0 {
-		rl.rateSetter = &burstRateSetter{rl, 1}
+		b := &burst{rl, 1}
+		rl.rateSetter = b
+		rl.coolDownIntervalGetter = b
+		rl.storedPermitsToWaitTimeBuilder = b
+	} else {
+		w := &warmup{
+			RateLimiter:       rl,
+			warmupPeriodMicro: int64(conf.WarmupPeriod / time.Microsecond),
+			coldFactor:        conf.ColdFactor,
+		}
+		rl.rateSetter = w
+		rl.coolDownIntervalGetter = w
+		rl.storedPermitsToWaitTimeBuilder = w
 	}
 
 	if !rl.SetRate(conf.PermitsPerSecond) {
